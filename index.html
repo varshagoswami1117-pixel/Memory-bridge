@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>MemoryBridge — Demo</title>
+  <style>
+    body{font-family: Arial, sans-serif; max-width:800px;margin:20px auto;padding:10px}
+    button{padding:8px 12px;margin:6px}
+    input, textarea{width:100%;padding:8px;margin:6px 0}
+    .card{border:1px solid #ddd;padding:12px;margin:8px 0;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h1>MemoryBridge — Demo</h1>
+
+  <section class="card">
+    <h3>Register User</h3>
+    <input id="name" placeholder="Name" />
+    <input id="age" placeholder="Age" />
+    <input id="generation" placeholder="generation (grandparent/parent/young)" />
+    <button id="btnRegister">Register</button>
+    <div id="registerResult"></div>
+  </section>
+
+  <section class="card">
+    <h3>Add Memory (text)</h3>
+    <input id="userIdForText" placeholder="user_id" />
+    <input id="titleText" placeholder="Title (optional)" />
+    <textarea id="textMemory" rows="5" placeholder="Write the memory here..."></textarea>
+    <button id="btnAddText">Add Memory</button>
+    <div id="addTextResult"></div>
+  </section>
+
+  <section class="card">
+    <h3>Upload Audio Memory</h3>
+    <input id="userIdForAudio" placeholder="user_id" />
+    <input id="titleAudio" placeholder="Title (optional)" />
+    <input id="memoryDate" placeholder="Memory date (YYYY-MM-DD)" />
+    <input type="file" id="audioFile" accept="audio/*" />
+    <button id="btnUploadAudio">Upload Audio</button>
+    <div id="uploadAudioResult"></div>
+  </section>
+
+  <section class="card">
+    <h3>Search / List Memories</h3>
+    <input id="q" placeholder="search keyword (optional)" />
+    <input id="filterUser" placeholder="filter user_id (optional)" />
+    <button id="btnList">List Memories</button>
+    <div id="memList"></div>
+  </section>
+
+  <script>
+    const API = 'http://127.0.0.1:5000';
+
+    document.getElementById('btnRegister').onclick = async () => {
+      const name = document.getElementById('name').value;
+      const age = document.getElementById('age').value;
+      const generation = document.getElementById('generation').value;
+      const res = await fetch(API + '/register_user', {
+        method: 'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name, age, generation})
+      });
+      const data = await res.json();
+      document.getElementById('registerResult').innerText = JSON.stringify(data);
+    }
+
+    document.getElementById('btnAddText').onclick = async () => {
+      const user_id = document.getElementById('userIdForText').value;
+      const title = document.getElementById('titleText').value;
+      const text = document.getElementById('textMemory').value;
+      const res = await fetch(API + '/add_memory_text', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id, title, text})});
+      const data = await res.json();
+      document.getElementById('addTextResult').innerText = JSON.stringify(data);
+    }
+
+    document.getElementById('btnUploadAudio').onclick = async () => {
+      const user_id = document.getElementById('userIdForAudio').value;
+      const title = document.getElementById('titleAudio').value;
+      const memory_date = document.getElementById('memoryDate').value;
+      const audioFile = document.getElementById('audioFile').files[0];
+      if(!audioFile){ alert('select audio file'); return; }
+      const form = new FormData();
+      form.append('user_id', user_id);
+      form.append('title', title);
+      form.append('memory_date', memory_date);
+      form.append('audio_file', audioFile);
+      const res = await fetch(API + '/upload_audio', {method:'POST', body: form});
+      const data = await res.json();
+      document.getElementById('uploadAudioResult').innerText = JSON.stringify(data);
+    }
+
+    document.getElementById('btnList').onclick = async () => {
+      const q = document.getElementById('q').value;
+      const user_id = document.getElementById('filterUser').value;
+      const params = new URLSearchParams();
+      if(q) params.append('q', q);
+      if(user_id) params.append('user_id', user_id);
+      const res = await fetch(API + '/get_memories?' + params.toString());
+      const data = await res.json();
+      const el = document.getElementById('memList');
+      el.innerHTML = '';
+      if(data.memories){
+        data.memories.forEach(m => {
+          const d = document.createElement('div'); d.className='card';
+          d.innerHTML = `<b>${m.title || '(no title)'}</b><br/>${m.text_preview || ''}<br/>Date: ${m.memory_date || 'N/A'}<br/>` + (m.audio_available ? `<a href="${API}/play_audio/${m.memory_id}" target="_blank">Play audio</a>` : '');
+          el.appendChild(d);
+        });
+      }
+    }
+  </script>
+</body>
+</html>
+
