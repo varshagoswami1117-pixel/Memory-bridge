@@ -26,6 +26,11 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "memory-bridge-dev-secret")
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "memory-bridge-jwt-secret")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=8)
+# The query-string token is used only for HTML5 audio playback because an
+# <audio> element cannot attach an Authorization header by itself.
+app.config["JWT_TOKEN_LOCATION"] = ["headers", "query_string"]
+app.config["JWT_QUERY_STRING_NAME"] = "token"
+app.config["JWT_QUERY_STRING_VALUE_PREFIX"] = ""
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
     "DATABASE_URL",
     "sqlite:///" + os.path.join(BASE_DIR, "memory_bridge.db"),
