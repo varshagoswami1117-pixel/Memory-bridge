@@ -1,46 +1,38 @@
 import os
 import re
+import sqlite3
 import uuid
-from datetime import timedelta
+import secrets
+import string
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from flask_jwt_extended import (
-    JWTManager,
-    create_access_token,
-    get_jwt_identity,
-    jwt_required,
-)
-from flask_sqlalchemy import SQLAlchemy
+from flask_jwt_extended import JWTManager, create_access_token, get_jwt_identity, jwt_required
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, or_
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+UPLOAD_ROOT = os.path.join(BASE_DIR, "uploads")
+REGISTRY_DB = os.path.join(DATA_DIR, "family_registry.db")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(UPLOAD_ROOT, exist_ok=True)
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "memory-bridge-dev-secret")
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "memory-bridge-jwt-secret")
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "memory-bridge-dev-secret-change-me")
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "memory-bridge-jwt-secret-change-me")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=8)
-# The query-string token is used only for HTML5 audio playback because an
-# <audio> element cannot attach an Authorization header by itself.
 app.config["JWT_TOKEN_LOCATION"] = ["headers", "query_string"]
 app.config["JWT_QUERY_STRING_NAME"] = "token"
 app.config["JWT_QUERY_STRING_VALUE_PREFIX"] = ""
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///" + os.path.join(BASE_DIR, "memory_bridge.db"),
-)
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
-
 CORS(app)
-db = SQLAlchemy(app)
-jwt = JWTManager(app)
 
 ALLOWED_AUDIO_EXTENSIONS = {"webm", "wav", "mp3", "m4a", "ogg"}
 TAG_KEYWORDS = {
@@ -54,36 +46,119 @@ TAG_KEYWORDS = {
     "food": ["food", "recipe", "kitchen", "cooking"],
 }
 
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(160), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, server_default=db.func.now())
-    memories = db.relationship(
-        "Memory",
-        backref="owner",
-        lazy=True,
-        cascade="all, delete-orphan",
-    )
+RegistryBase = declarative_base()
+FamilyBase = declarative_base()
 
-class Memory(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(180), nullable=False)
-    family_member = db.Column(db.String(100), nullable=False)
-    relationship = db.Column(db.String(80), nullable=False)
-    memory_text = db.Column(db.Text, nullable=True)
-    transcript = db.Column(db.Text, nullable=True)
-    audio_filename = db.Column(db.String(255), nullable=True)
-    summary = db.Column(db.Text, nullable=True)
-    tags = db.Column(db.String(500), nullable=True)
-    created_at = db.Column(db.DateTime, server_default=db.func.now())
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+
+class FamilyRegistry(RegistryBase):
+    __tablename__ = "families"
+    id = Column(Integer, primary_key=True)
+    family_code = Column(String(32), unique=True, nullable=False, index=True)
+    family_name = Column(String(120), nullable=False)
+    database_filename = Column(String(120), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class FamilyUser(FamilyBase):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    email = Column(String(160), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(20), nullable=False, default="member")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    memories_created = relationship("Memory", back_populates="creator", foreign_keys="Memory.created_by")
+
+
+class Memory(FamilyBase):
+    __tablename__ = "memories"
+    id = Column(Integer, primary_key=True)
+    title = Column(String(180), nullable=False)
+    memory_text = Column(Text, nullable=True)
+    transcript = Column(Text, nullable=True)
+    audio_filename = Column(String(255), nullable=True)
+    summary = Column(Text, nullable=True)
+    tags = Column(String(500), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    shared_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    creator = relationship("FamilyUser", foreign_keys=[created_by], back_populates="memories_created")
+    shared_by = relationship("FamilyUser", foreign_keys=[shared_by_user_id])
+
+
+registry_engine = create_engine(f"sqlite:///{REGISTRY_DB}", future=True)
+RegistryBase.metadata.create_all(registry_engine)
+RegistrySession = sessionmaker(bind=registry_engine, expire_on_commit=False)
 
 def clean_text(value, max_length=10000):
-    if value is None:
-        return ""
-    return str(value).strip()[:max_length]
+    return str(value or "").strip()[:max_length]
+
+def registry_session():
+    return RegistrySession()
+
+def family_record(code):
+    code = clean_text(code, 32).upper()
+    session = registry_session()
+    try:
+        return session.query(FamilyRegistry).filter_by(family_code=code).first()
+    finally:
+        session.close()
+
+def family_engine(family):
+    path = os.path.join(DATA_DIR, family.database_filename)
+    return create_engine(f"sqlite:///{path}", future=True)
+
+def family_session(family):
+    engine = family_engine(family)
+    FamilyBase.metadata.create_all(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)(), engine
+
+def safe_family_code():
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        code = "MB-" + "".join(secrets.choice(alphabet) for _ in range(7))
+        if not family_record(code):
+            return code
+
+def create_family_database(family_name, creator_name, email, password):
+    code = safe_family_code()
+    filename = f"family_{uuid.uuid4().hex}.db"
+    registry = registry_session()
+    family = FamilyRegistry(family_code=code, family_name=family_name, database_filename=filename)
+    registry.add(family)
+    registry.commit()
+    registry.refresh(family)
+    registry.close()
+
+    session, _ = family_session(family)
+    user = FamilyUser(
+        name=creator_name,
+        email=email.lower(),
+        password_hash=generate_password_hash(password),
+        role="admin",
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    session.close()
+    return family, user
+
+def jwt_identity():
+    identity = get_jwt_identity()
+    if not isinstance(identity, dict):
+        return None
+    return identity
+
+def authenticated_context():
+    identity = jwt_identity()
+    if not identity or not identity.get("family_code") or not identity.get("user_id"):
+        return None, None, None
+    family = family_record(identity["family_code"])
+    if not family:
+        return identity, None, None
+    session, engine = family_session(family)
+    user = session.get(FamilyUser, int(identity["user_id"]))
+    return identity, family, (session, engine, user)
 
 def allowed_audio(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_AUDIO_EXTENSIONS
@@ -102,34 +177,29 @@ def make_summary(text):
     sentences = re.split(r"(?<=[.!?])\s+", text)
     useful = " ".join(sentences[:2]).strip()
     words = useful.split()
-    if len(words) > 45:
-        useful = " ".join(words[:45]) + "..."
-    return useful
+    return " ".join(words[:45]) + ("..." if len(words) > 45 else "")
 
 def make_tags(text):
     lower = clean_text(text).lower()
-    found = []
-    for tag, keywords in TAG_KEYWORDS.items():
-        if any(keyword in lower for keyword in keywords):
-            found.append(tag)
+    found = [tag for tag, keywords in TAG_KEYWORDS.items() if any(k in lower for k in keywords)]
     return found[:6]
 
-def memory_to_dict(memory):
-    tags = [tag for tag in (memory.tags or "").split(",") if tag]
-    audio_url = None
-    if memory.audio_filename:
-        audio_url = f"/api/memories/{memory.id}/audio"
+def user_dict(user):
+    return {"id": user.id, "name": user.name, "email": user.email, "role": user.role}
 
+def memory_dict(memory, session):
+    creator = session.get(FamilyUser, memory.created_by)
+    subject = session.get(FamilyUser, memory.shared_by_user_id) if memory.shared_by_user_id else None
     return {
         "id": memory.id,
         "title": memory.title,
-        "family_member": memory.family_member,
-        "relationship": memory.relationship,
         "memory_text": memory.memory_text or "",
         "transcript": memory.transcript or "",
         "summary": memory.summary or "",
-        "tags": tags,
-        "audio_url": audio_url,
+        "tags": [x for x in (memory.tags or "").split(",") if x],
+        "audio_url": f"/api/memories/{memory.id}/audio" if memory.audio_filename else None,
+        "created_by": user_dict(creator) if creator else None,
+        "shared_by": user_dict(subject) if subject else None,
         "created_at": memory.created_at.isoformat() if memory.created_at else None,
     }
 
@@ -137,163 +207,226 @@ def memory_to_dict(memory):
 def health():
     return jsonify({"status": "ok", "message": "Memory Bridge backend is running."})
 
-@app.post("/api/auth/register")
-def register():
+@app.post("/api/families/create")
+def create_family():
     data = request.get_json(silent=True) or {}
+    family_name = clean_text(data.get("family_name"), 120)
     name = clean_text(data.get("name"), 100)
     email = clean_text(data.get("email"), 160).lower()
     password = str(data.get("password") or "")
+    if not family_name or not name or not email or not password:
+        return jsonify({"message": "Family name, your name, email and password are required."}), 400
+    if "@" not in email:
+        return jsonify({"message": "Please enter a valid email address."}), 400
+    if len(password) < 6:
+        return jsonify({"message": "Password must contain at least 6 characters."}), 400
 
+    family, user = create_family_database(family_name, name, email, password)
+    token = create_access_token(identity={"family_code": family.family_code, "user_id": user.id})
+    return jsonify({
+        "token": token,
+        "family": {"code": family.family_code, "name": family.family_name, "role": user.role},
+        "user": user_dict(user),
+    }), 201
+
+@app.post("/api/families/join")
+def join_family():
+    data = request.get_json(silent=True) or {}
+    code = clean_text(data.get("family_code"), 32).upper()
+    name = clean_text(data.get("name"), 100)
+    email = clean_text(data.get("email"), 160).lower()
+    password = str(data.get("password") or "")
+    family = family_record(code)
+    if not family:
+        return jsonify({"message": "Family code not found. Check the code and try again."}), 404
     if not name or not email or not password:
         return jsonify({"message": "Name, email and password are required."}), 400
     if len(password) < 6:
         return jsonify({"message": "Password must contain at least 6 characters."}), 400
-    if "@" not in email:
-        return jsonify({"message": "Please enter a valid email address."}), 400
-    if User.query.filter_by(email=email).first():
-        return jsonify({"message": "An account with this email already exists."}), 409
 
-    user = User(
-        name=name,
-        email=email,
-        password_hash=generate_password_hash(password),
-    )
-    db.session.add(user)
-    db.session.commit()
-
-    token = create_access_token(identity=str(user.id))
-    return jsonify({
-        "token": token,
-        "user": {"id": user.id, "name": user.name, "email": user.email},
-    }), 201
+    session, _ = family_session(family)
+    try:
+        if session.query(FamilyUser).filter_by(email=email).first():
+            return jsonify({"message": "That email is already a member of this family."}), 409
+        user = FamilyUser(name=name, email=email, password_hash=generate_password_hash(password), role="member")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        token = create_access_token(identity={"family_code": family.family_code, "user_id": user.id})
+        return jsonify({
+            "token": token,
+            "family": {"code": family.family_code, "name": family.family_name, "role": user.role},
+            "user": user_dict(user),
+        }), 201
+    finally:
+        session.close()
 
 @app.post("/api/auth/login")
 def login():
     data = request.get_json(silent=True) or {}
+    code = clean_text(data.get("family_code"), 32).upper()
     email = clean_text(data.get("email"), 160).lower()
     password = str(data.get("password") or "")
+    family = family_record(code)
+    if not family:
+        return jsonify({"message": "Family code not found."}), 404
 
-    user = User.query.filter_by(email=email).first()
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({"message": "Invalid email or password."}), 401
-
-    token = create_access_token(identity=str(user.id))
-    return jsonify({
-        "token": token,
-        "user": {"id": user.id, "name": user.name, "email": user.email},
-    })
+    session, _ = family_session(family)
+    try:
+        user = session.query(FamilyUser).filter_by(email=email).first()
+        if not user or not check_password_hash(user.password_hash, password):
+            return jsonify({"message": "Invalid family code, email or password."}), 401
+        token = create_access_token(identity={"family_code": family.family_code, "user_id": user.id})
+        return jsonify({
+            "token": token,
+            "family": {"code": family.family_code, "name": family.family_name, "role": user.role},
+            "user": user_dict(user),
+        })
+    finally:
+        session.close()
 
 @app.get("/api/auth/me")
 @jwt_required()
 def current_user():
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user:
-        return jsonify({"message": "User not found."}), 404
-    return jsonify({"id": user.id, "name": user.name, "email": user.email})
+    identity, family, context = authenticated_context()
+    if not family or not context or not context[2]:
+        return jsonify({"message": "Family or user session is no longer valid."}), 401
+    session, _, user = context
+    try:
+        return jsonify({
+            "family": {"code": family.family_code, "name": family.family_name, "role": user.role},
+            "user": user_dict(user),
+        })
+    finally:
+        session.close()
+
+@app.get("/api/family/members")
+@jwt_required()
+def family_members():
+    identity, family, context = authenticated_context()
+    if not family or not context or not context[2]:
+        return jsonify({"message": "Invalid family session."}), 401
+    session, _, _ = context
+    try:
+        members = session.query(FamilyUser).order_by(FamilyUser.name.asc()).all()
+        return jsonify([user_dict(member) for member in members])
+    finally:
+        session.close()
 
 @app.get("/api/memories")
 @jwt_required()
 def list_memories():
-    user_id = int(get_jwt_identity())
+    identity, family, context = authenticated_context()
+    if not family or not context or not context[2]:
+        return jsonify({"message": "Invalid family session."}), 401
+    session, _, _ = context
     query = clean_text(request.args.get("q"), 120)
-
-    memories_query = Memory.query.filter_by(user_id=user_id)
-    if query:
-        pattern = f"%{query}%"
-        memories_query = memories_query.filter(
-            db.or_(
+    try:
+        q = session.query(Memory)
+        if query:
+            pattern = f"%{query}%"
+            q = q.filter(or_(
                 Memory.title.ilike(pattern),
-                Memory.family_member.ilike(pattern),
-                Memory.relationship.ilike(pattern),
                 Memory.memory_text.ilike(pattern),
                 Memory.transcript.ilike(pattern),
                 Memory.tags.ilike(pattern),
-            )
-        )
-
-    memories = memories_query.order_by(Memory.created_at.desc()).all()
-    return jsonify([memory_to_dict(memory) for memory in memories])
+            ))
+        memories = q.order_by(Memory.created_at.desc()).all()
+        return jsonify([memory_dict(m, session) for m in memories])
+    finally:
+        session.close()
 
 @app.post("/api/memories")
 @jwt_required()
 def create_memory():
-    user_id = int(get_jwt_identity())
-    family_member = clean_text(request.form.get("family_member"), 100)
-    relationship = clean_text(request.form.get("relationship"), 80)
+    identity, family, context = authenticated_context()
+    if not family or not context or not context[2]:
+        return jsonify({"message": "Invalid family session."}), 401
+    session, _, current = context
+
+    shared_by_user_id = request.form.get("shared_by_user_id")
+    title = clean_text(request.form.get("title"), 180)
     memory_text = clean_text(request.form.get("memory_text"))
     transcript = clean_text(request.form.get("transcript"))
-    title = clean_text(request.form.get("title"), 180)
+    combined = transcript or memory_text
 
-    if not family_member or not relationship:
-        return jsonify({"message": "Family member name and relationship are required."}), 400
-
-    combined_text = transcript or memory_text
-    if not combined_text:
+    if not shared_by_user_id:
+        session.close()
+        return jsonify({"message": "Please select the family member whose memory is being recorded."}), 400
+    subject = session.get(FamilyUser, int(shared_by_user_id))
+    if not subject:
+        session.close()
+        return jsonify({"message": "Selected family member does not belong to this family."}), 400
+    if not combined:
+        session.close()
         return jsonify({"message": "Please add a text memory or transcript."}), 400
 
     audio_filename = None
     audio = request.files.get("audio")
-    if audio and audio.filename:
-        original = secure_filename(audio.filename)
-        if not allowed_audio(original):
-            return jsonify({"message": "Unsupported audio format."}), 400
-        extension = original.rsplit(".", 1)[1].lower()
-        audio_filename = f"{uuid.uuid4().hex}.{extension}"
-        audio.save(os.path.join(UPLOAD_DIR, audio_filename))
+    try:
+        if audio and audio.filename:
+            original = secure_filename(audio.filename)
+            if not allowed_audio(original):
+                return jsonify({"message": "Unsupported audio format."}), 400
+            extension = original.rsplit(".", 1)[1].lower()
+            audio_filename = f"{uuid.uuid4().hex}.{extension}"
+            family_upload_dir = os.path.join(UPLOAD_ROOT, family.family_code)
+            os.makedirs(family_upload_dir, exist_ok=True)
+            audio.save(os.path.join(family_upload_dir, audio_filename))
 
-    memory = Memory(
-        title=title or make_title(combined_text),
-        family_member=family_member,
-        relationship=relationship,
-        memory_text=memory_text,
-        transcript=transcript,
-        audio_filename=audio_filename,
-        summary=make_summary(combined_text),
-        tags=",".join(make_tags(combined_text)),
-        user_id=user_id,
-    )
-    db.session.add(memory)
-    db.session.commit()
-
-    return jsonify(memory_to_dict(memory)), 201
-
-@app.get("/api/memories/<int:memory_id>")
-@jwt_required()
-def get_memory(memory_id):
-    user_id = int(get_jwt_identity())
-    memory = Memory.query.filter_by(id=memory_id, user_id=user_id).first()
-    if not memory:
-        return jsonify({"message": "Memory not found."}), 404
-    return jsonify(memory_to_dict(memory))
+        memory = Memory(
+            title=title or make_title(combined),
+            memory_text=memory_text,
+            transcript=transcript,
+            audio_filename=audio_filename,
+            summary=make_summary(combined),
+            tags=",".join(make_tags(combined)),
+            created_by=current.id,
+            shared_by_user_id=subject.id,
+        )
+        session.add(memory)
+        session.commit()
+        session.refresh(memory)
+        return jsonify(memory_dict(memory, session)), 201
+    finally:
+        session.close()
 
 @app.get("/api/memories/<int:memory_id>/audio")
 @jwt_required()
 def memory_audio(memory_id):
-    user_id = int(get_jwt_identity())
-    memory = Memory.query.filter_by(id=memory_id, user_id=user_id).first()
-    if not memory or not memory.audio_filename:
-        return jsonify({"message": "Audio not found."}), 404
-    return send_from_directory(UPLOAD_DIR, memory.audio_filename, as_attachment=False)
+    identity, family, context = authenticated_context()
+    if not family or not context or not context[2]:
+        return jsonify({"message": "Invalid family session."}), 401
+    session, _, _ = context
+    try:
+        memory = session.get(Memory, memory_id)
+        if not memory or not memory.audio_filename:
+            return jsonify({"message": "Audio not found."}), 404
+        directory = os.path.join(UPLOAD_ROOT, family.family_code)
+        return send_from_directory(directory, memory.audio_filename, as_attachment=False)
+    finally:
+        session.close()
 
 @app.delete("/api/memories/<int:memory_id>")
 @jwt_required()
 def delete_memory(memory_id):
-    user_id = int(get_jwt_identity())
-    memory = Memory.query.filter_by(id=memory_id, user_id=user_id).first()
-    if not memory:
-        return jsonify({"message": "Memory not found."}), 404
-
-    if memory.audio_filename:
-        path = os.path.join(UPLOAD_DIR, memory.audio_filename)
-        if os.path.exists(path):
-            os.remove(path)
-
-    db.session.delete(memory)
-    db.session.commit()
-    return jsonify({"message": "Memory deleted."})
-
-with app.app_context():
-    db.create_all()
+    identity, family, context = authenticated_context()
+    if not family or not context or not context[2]:
+        return jsonify({"message": "Invalid family session."}), 401
+    session, _, _ = context
+    try:
+        memory = session.get(Memory, memory_id)
+        if not memory:
+            return jsonify({"message": "Memory not found."}), 404
+        if memory.audio_filename:
+            path = os.path.join(UPLOAD_ROOT, family.family_code, memory.audio_filename)
+            if os.path.exists(path):
+                os.remove(path)
+        session.delete(memory)
+        session.commit()
+        return jsonify({"message": "Memory deleted."})
+    finally:
+        session.close()
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
