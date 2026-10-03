@@ -18,6 +18,8 @@ jobs:
         run: pip install -r backend/requirements.txt
       - name: Compile backend
         run: python -m py_compile backend/app.py
+      - name: Run family isolation test
+        run: pytest -q backend/test_family_isolation.py
 
   frontend:
     runs-on: ubuntu-latest
