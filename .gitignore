@@ -4,6 +4,7 @@ __pycache__/
 backend/venv/
 backend/.venv/
 backend/*.db
+backend/databases/*.db
 
 # Environment
 .env
